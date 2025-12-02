@@ -1,0 +1,21 @@
+# Node / frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/.env.local
+frontend/.env.*.local
+
+# Python / backend
+backend/__pycache__/
+backend/.venv/
+backend/venv/
+backend/*.sqlite3
+backend/*.db
+
+# Common
+.env
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
