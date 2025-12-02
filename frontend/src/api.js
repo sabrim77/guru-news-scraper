@@ -15,19 +15,14 @@ async function handleResponse(res) {
     let text = "";
     try {
       text = await res.text();
-    } catch (_) {
-      // ignore
-    }
+    } catch (_) {}
     throw new Error(`HTTP ${res.status}: ${text || res.statusText}`);
   }
-  // FastAPI always returns JSON here
   return res.json();
 }
 
 /**
  * Generic GET helper with query params.
- * @param {string} path - e.g. "/api/v1/news/latest"
- * @param {Record<string, string | number | undefined>} [params]
  */
 async function get(path, params) {
   const search = new URLSearchParams();
@@ -48,112 +43,114 @@ async function get(path, params) {
 }
 
 /**
- * Health check: GET /api/v1/health
- * @returns {Promise<{status: string}>}
+ * Generic POST helper with JSON body.
  */
+async function post(path, body) {
+  const url = `${API_BASE_URL}${path}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body ?? {}),
+  });
+  return handleResponse(res);
+}
+
+// -------------------------------------------------------------
+// HEALTH
+// -------------------------------------------------------------
+
 export async function apiHealth() {
   return get("/api/v1/health");
 }
 
-/**
- * Latest news (DB-backed feed).
- * GET /api/v1/news/latest
- *
- * @param {Object} [opts]
- * @param {number} [opts.limit=10]
- * @param {number} [opts.offset=0]
- * @param {string} [opts.portal] - Optional portal id, e.g. "prothomalo", "bbc"
- * @returns {Promise<{count:number, limit:number, offset:number, items:Array}>}
- */
+// -------------------------------------------------------------
+// LATEST NEWS
+// -------------------------------------------------------------
+
 export async function apiLatestNews({ limit = 10, offset = 0, portal } = {}) {
-  return get("/api/v1/news/latest", {
-    limit,
-    offset,
-    portal,
-  });
+  return get("/api/v1/news/latest", { limit, offset, portal });
 }
 
-/**
- * News by topic (DB-backed feed).
- * GET /api/v1/news/by_topic
- *
- * @param {Object} opts
- * @param {string} opts.topic - e.g. "politics", "sports", "health"
- * @param {number} [opts.limit=10]
- * @param {number} [opts.offset=0]
- * @param {string} [opts.portal] - Optional portal filter
- */
+// -------------------------------------------------------------
+// NEWS BY TOPIC
+// -------------------------------------------------------------
+
 export async function apiNewsByTopic({
   topic,
   limit = 10,
   offset = 0,
   portal,
 } = {}) {
-  if (!topic) {
-    throw new Error("topic is required for apiNewsByTopic");
-  }
-
-  return get("/api/v1/news/by_topic", {
-    topic,
-    limit,
-    offset,
-    portal,
-  });
+  if (!topic) throw new Error("topic is required for apiNewsByTopic");
+  return get("/api/v1/news/by_topic", { topic, limit, offset, portal });
 }
 
-/**
- * Live keyword fetch (RSS-based).
- * GET /api/v1/news/search
- *
- * @param {Object} opts
- * @param {string} opts.q - Raw user query, e.g. "bitcoin, tesla"
- * @param {string} [opts.lang] - Optional lang filter: "en", "bn", "english", "bangla"
- * @param {string} [opts.country] - Optional country filter: "bd", "intl", etc.
- *
- * Response shape:
- * {
- *   raw_query: string,
- *   lang: string | null,
- *   country: string | null,
- *   keywords: string[],
- *   total_fetched: number,
- *   by_keyword: {
- *     [kw: string]: Array<{
- *       title: string,
- *       url: string,
- *       summary: string | null,
- *       content: string | null,
- *       source: string,
- *       keyword: string,
- *       published_at: string | null
- *     }>
- *   }
- * }
- */
+// -------------------------------------------------------------
+// KEYWORD FETCH
+// -------------------------------------------------------------
+
 export async function apiKeywordFetch({ q, lang, country } = {}) {
   const query = (q || "").trim();
-  if (!query) {
-    throw new Error("q (keyword query) is required for apiKeywordFetch");
-  }
-
-  return get("/api/v1/news/search", {
-    q: query,
-    lang,
-    country,
-  });
+  if (!query) throw new Error("q (keyword query) is required");
+  return get("/api/v1/news/search", { q: query, lang, country });
 }
 
-/**
- * Fetch a single article by URL (DB-backed).
- * GET /api/v1/news/by_url
- *
- * @param {string} url - Exact article URL stored in DB
- * @returns {Promise<{found:boolean, item:object|null}>}
- */
-export async function apiNewsByUrl(url) {
-  if (!url) {
-    throw new Error("url is required for apiNewsByUrl");
-  }
+// -------------------------------------------------------------
+// ARTICLE BY URL
+// -------------------------------------------------------------
 
+export async function apiNewsByUrl(url) {
+  if (!url) throw new Error("url is required for apiNewsByUrl");
   return get("/api/v1/news/by_url", { url });
+}
+
+// -------------------------------------------------------------
+// SENTIMENT: arbitrary text
+// -------------------------------------------------------------
+
+export async function apiAnalyzeSentimentText(text) {
+  const t = (text || "").trim();
+  if (!t) throw new Error("text is required for apiAnalyzeSentimentText");
+  return post("/api/v1/analyze/sentiment_text", { text: t });
+}
+
+// -------------------------------------------------------------
+// SENTIMENT: article by URL
+// -------------------------------------------------------------
+
+export async function apiNewsSentimentByUrl(url) {
+  if (!url) throw new Error("url is required for apiNewsSentimentByUrl");
+  return get("/api/v1/news/sentiment_by_url", { url });
+}
+
+// -------------------------------------------------------------
+// 🔥 NEW — SENTIMENT OVERVIEW FOR DASHBOARD
+// GET /api/v1/analytics/bd_sentiment_overview
+// -------------------------------------------------------------
+
+/**
+ * Fetch overall Bangladesh sentiment summary for dashboard.
+ *
+ * Response:
+ * {
+ *   total: number,
+ *   positive: number,
+ *   negative: number,
+ *   neutral: number,
+ *   unknown: number,
+ *   positive_pct: number,
+ *   negative_pct: number,
+ *   neutral_pct: number,
+ *   unknown_pct: number
+ * }
+ *
+ * @param {Object} opts
+ * @param {number} [opts.limit=200] - How many latest rows from DB
+ * @param {string} [opts.portal] - Optional portal filter
+ */
+export async function apiSentimentOverview({ limit = 200, portal } = {}) {
+  return get("/api/v1/analytics/bd_sentiment_overview", {
+    limit,
+    portal,
+  });
 }

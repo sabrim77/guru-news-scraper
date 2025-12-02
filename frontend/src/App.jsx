@@ -10,8 +10,9 @@ import NewsStoreReports from "./pages/news/NewsStoreReports";
 
 export default function App() {
   const [collapsed, setCollapsed] = useState(false);
-  const [activePage, setActivePage] = useState("dashboard"); // default
+  const [activePage, setActivePage] = useState("dashboard");
 
+  // Page Title Mapping
   const pageTitle = useMemo(() => {
     switch (activePage) {
       case "dashboard":
@@ -25,6 +26,7 @@ export default function App() {
     }
   }, [activePage]);
 
+  // Which page to show
   const renderPage = () => {
     switch (activePage) {
       case "dashboard":
@@ -39,7 +41,16 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen flex bg-slate-950 text-slate-100">
+    <div className="h-screen w-screen flex overflow-hidden bg-slate-950 text-slate-100">
+
+      {/* GLOBAL cyber grid background */}
+      <div className="pointer-events-none fixed inset-0 z-0 
+        bg-[linear-gradient(to_right,rgba(255,255,255,0.04)_1px,transparent_1px),
+            linear-gradient(to_bottom,rgba(255,255,255,0.04)_1px,transparent_1px)]
+        bg-[size:38px_38px] opacity-10" 
+      />
+
+      {/* SIDEBAR */}
       <Sidebar
         collapsed={collapsed}
         setCollapsed={setCollapsed}
@@ -47,12 +58,21 @@ export default function App() {
         onPageChange={setActivePage}
       />
 
-      <div className="flex-1 flex flex-col">
-        <Navbar title={pageTitle} />
+      {/* MAIN AREA (Navbar + Page Content) */}
+      <div className="relative flex flex-1 flex-col z-10">
 
-        <main className="flex-1 p-4 md:p-6 bg-slate-900/40 overflow-y-auto">
+        {/* NAVBAR */}
+        <Navbar
+          collapsed={collapsed}
+          setCollapsed={setCollapsed}
+          title={pageTitle}
+        />
+
+        {/* PAGE CONTENT AREA */}
+        <main className="flex-1 overflow-y-auto px-4 md:px-6 py-4 bg-slate-900/40 backdrop-blur-sm">
           {renderPage()}
         </main>
+
       </div>
     </div>
   );
