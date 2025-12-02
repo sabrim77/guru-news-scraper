@@ -3,12 +3,16 @@
 from typing import Optional, List, Dict
 from datetime import datetime
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 
 from core import db
 from core.fetch import fetch_news_from_user_query
+from core.bd_sentiment import (
+    analyze_bangladesh_sentiment,
+    SentimentNotAvailable,
+)
 
 
 # ============================================================
@@ -75,6 +79,26 @@ class KeywordFetchResponse(BaseModel):
     keywords: List[str]
     total_fetched: int
     by_keyword: Dict[str, List[FetchedArticle]]
+
+
+# ---------------- Sentiment models ----------------
+
+class SentimentResult(BaseModel):
+    label: str                      # positive | negative | neutral
+    score: float                    # confidence
+    towards_bangladesh: str         # positive | negative | neutral | unknown
+    raw_label: str                  # original HF label (e.g. 1 star, 5 stars)
+
+
+class AnalyzeTextRequest(BaseModel):
+    text: str
+
+
+class NewsSentimentResponse(BaseModel):
+    url: HttpUrl
+    title: Optional[str] = None
+    portal: Optional[str] = None
+    sentiment: SentimentResult
 
 
 # ============================================================
@@ -335,3 +359,67 @@ def by_url(
 
     item = _row_to_news_item(row)
     return SingleNewsResponse(found=True, item=item)
+
+
+# ============================================================
+# SENTIMENT: arbitrary text
+# ============================================================
+
+@app.post("/api/v1/analyze/sentiment_text", response_model=SentimentResult)
+def analyze_sentiment_text(payload: AnalyzeTextRequest):
+    """
+    Analyze sentiment of arbitrary text and estimate whether it is
+    positive/negative towards Bangladesh.
+    """
+    txt = (payload.text or "").strip()
+    if not txt:
+        raise HTTPException(status_code=400, detail="Text must not be empty")
+
+    try:
+        result = analyze_bangladesh_sentiment(txt)
+    except SentimentNotAvailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    return SentimentResult(**result)
+
+
+# ============================================================
+# SENTIMENT: for a stored news article (by URL)
+# ============================================================
+
+@app.get("/api/v1/news/sentiment_by_url", response_model=NewsSentimentResponse)
+def sentiment_by_url(
+    url: HttpUrl = Query(
+        ...,
+        description="Exact article URL that was scraped and stored in DB",
+    )
+):
+    """
+    Fetch article from DB by URL, then run Bangladesh sentiment analysis.
+
+    Uses content if available, else summary, else title.
+    """
+    row = db.get_by_url(str(url))
+    if not row:
+        raise HTTPException(status_code=404, detail="Article not found in DB")
+
+    item = _row_to_news_item(row)
+
+    text = item.content or item.summary or item.title
+    if not text:
+        raise HTTPException(
+            status_code=400,
+            detail="Article has no content/summary/title to analyze",
+        )
+
+    try:
+        result = analyze_bangladesh_sentiment(text)
+    except SentimentNotAvailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    return NewsSentimentResponse(
+        url=item.url,
+        title=item.title,
+        portal=item.portal,
+        sentiment=SentimentResult(**result),
+    )
