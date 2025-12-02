@@ -14,16 +14,11 @@ from core.bd_sentiment import (
     SentimentNotAvailable,
 )
 
-
 # ============================================================
-# Pydantic models (response schemas)
+# Pydantic models
 # ============================================================
 
 class NewsItem(BaseModel):
-    """
-    DB-backed article row (from core.db).
-    Used for latest feed, topic feed, etc.
-    """
     id: int
     portal: str
     url: HttpUrl
@@ -31,8 +26,8 @@ class NewsItem(BaseModel):
     summary: Optional[str] = None
     content: Optional[str] = None
     topic: Optional[str] = None
-    pub_date: Optional[str] = None          # RSS date (stored as string in DB)
-    article_pub_date: Optional[str] = None  # parsed HTML date (string)
+    pub_date: Optional[str] = None
+    article_pub_date: Optional[str] = None
     author: Optional[str] = None
 
 
@@ -48,46 +43,13 @@ class SingleNewsResponse(BaseModel):
     item: Optional[NewsItem] = None
 
 
-class FetchedArticle(BaseModel):
-    """
-    One article returned by keyword-based RSS fetch (core.fetch).
-
-    Matches the dicts produced in fetch_news_for_keyword():
-        {
-            "title": str,
-            "url": str,
-            "summary": str,
-            "content": None,
-            "source": portal_id,
-            "keyword": keyword,
-            "published_at": datetime | None,
-        }
-    """
-    title: str
-    url: HttpUrl
-    summary: Optional[str] = None
-    content: Optional[str] = None
-    source: str
-    keyword: str
-    published_at: Optional[datetime] = None
-
-
-class KeywordFetchResponse(BaseModel):
-    raw_query: str
-    lang: Optional[str]
-    country: Optional[str]
-    keywords: List[str]
-    total_fetched: int
-    by_keyword: Dict[str, List[FetchedArticle]]
-
-
 # ---------------- Sentiment models ----------------
 
 class SentimentResult(BaseModel):
-    label: str                      # positive | negative | neutral
-    score: float                    # confidence
-    towards_bangladesh: str         # positive | negative | neutral | unknown
-    raw_label: str                  # original HF label (e.g. 1 star, 5 stars)
+    label: str
+    score: float
+    towards_bangladesh: str
+    raw_label: str
 
 
 class AnalyzeTextRequest(BaseModel):
@@ -99,6 +61,39 @@ class NewsSentimentResponse(BaseModel):
     title: Optional[str] = None
     portal: Optional[str] = None
     sentiment: SentimentResult
+
+
+class SentimentOverview(BaseModel):
+    total: int
+    positive: int
+    negative: int
+    neutral: int
+    unknown: int
+    positive_pct: float
+    negative_pct: float
+    neutral_pct: float
+    unknown_pct: float
+
+
+class FetchedArticle(BaseModel):
+    title: str
+    url: HttpUrl
+    summary: Optional[str] = None
+    content: Optional[str] = None
+    source: str
+    keyword: str
+    published_at: Optional[datetime] = None
+    sentiment: Optional[SentimentResult] = None
+
+
+class KeywordFetchResponse(BaseModel):
+    raw_query: str
+    lang: Optional[str]
+    country: Optional[str]
+    keywords: List[str]
+    total_fetched: int
+    by_keyword: Dict[str, List[FetchedArticle]]
+    sentiment_overview: Optional[SentimentOverview] = None
 
 
 # ============================================================
@@ -127,41 +122,26 @@ app.add_middleware(
 
 @app.on_event("startup")
 def startup():
-    # Ensure DB exists / migrations done
     db.init_db()
 
 
 # ============================================================
-# Helpers: row -> NewsItem
+# Helpers: row → NewsItem
 # ============================================================
 
 def _row_to_news_item(row) -> NewsItem:
-    """
-    Map DB row (dict or sqlite.Row) to NewsItem.
-
-    Works with:
-        - dict (row["col"] and row.get("col"))
-        - sqlite3.Row (row["col"], supports .keys(), but no .get())
-    """
-
     def _get(col: str):
-        # If it's a normal dict-like:
         if isinstance(row, dict):
             return row.get(col)
-
-        # sqlite3.Row or similar
         try:
             if hasattr(row, "keys"):
-                keys = row.keys()
-                if col in keys:
+                if col in row.keys():
                     return row[col]
         except Exception:
-            # Fallback: best-effort index access
             try:
                 return row[col]
             except Exception:
                 return None
-
         return None
 
     return NewsItem(
@@ -188,107 +168,46 @@ def health():
 
 
 # ============================================================
-# LATEST FEED (DB, no keyword / no topic)
+# LATEST FEED
 # ============================================================
 
 @app.get("/api/v1/news/latest", response_model=PaginatedNews)
 def latest_news(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
-    portal: Optional[str] = Query(
-        None,
-        description="Optional portal filter, e.g. 'prothomalo', 'bbc'",
-    ),
+    portal: Optional[str] = None,
 ):
-    """
-    Get latest news items from DB, optionally filtered by portal.
-
-    This is purely a DB read, using whatever the scraper has already
-    ingested (core.runner or keyword fetch).
-    """
-    # core.db.get_latest should support: (limit, offset, portal=None)
     rows = db.get_latest(limit=limit, offset=offset, portal=portal)
     items = [_row_to_news_item(r) for r in rows]
-
-    return PaginatedNews(
-        count=len(items),
-        limit=limit,
-        offset=offset,
-        items=items,
-    )
+    return PaginatedNews(count=len(items), limit=limit, offset=offset, items=items)
 
 
 # ============================================================
-# TOPIC FEED (DB, structured filter)
+# TOPIC FEED
 # ============================================================
 
 @app.get("/api/v1/news/by_topic", response_model=PaginatedNews)
 def news_by_topic(
-    topic: str = Query(
-        ...,
-        description="Classifier topic label, e.g. politics, sports, health, tech",
-    ),
-    portal: Optional[str] = Query(
-        None,
-        description="Optional portal filter",
-    ),
-    limit: int = Query(50, ge=1, le=200),
-    offset: int = Query(0, ge=0),
+    topic: str,
+    portal: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
 ):
-    """
-    Topic-based DB feed:
-        - Filter by classifier topic label (stored in DB.news.topic)
-        - Optional portal filter
-        - NO keyword / full-text FTS here
-    """
-    rows = db.get_latest_by_topic(
-        topic=topic,
-        portal=portal,
-        limit=limit,
-        offset=offset,
-    )
+    rows = db.get_latest_by_topic(topic=topic, portal=portal, limit=limit, offset=offset)
     items = [_row_to_news_item(r) for r in rows]
-
-    return PaginatedNews(
-        count=len(items),
-        limit=limit,
-        offset=offset,
-        items=items,
-    )
+    return PaginatedNews(count=len(items), limit=limit, offset=offset, items=items)
 
 
 # ============================================================
-# KEYWORD SEARCH (RSS FETCH using core.fetch)
+# KEYWORD SEARCH
 # ============================================================
 
 @app.get("/api/v1/news/search", response_model=KeywordFetchResponse)
 def keyword_search(
-    q: str = Query(
-        ...,
-        description=(
-            "Keyword(s) or phrase(s) to fetch from RSS. "
-            "Examples: 'bitcoin', 'bitcoin, tesla', 'দেশে ফেরার সিদ্ধান্ত'"
-        ),
-    ),
-    lang: Optional[str] = Query(
-        None,
-        description="Optional language filter: en, bn, english, bangla",
-    ),
-    country: Optional[str] = Query(
-        None,
-        description="Optional country filter: bd, bangladesh, intl, international",
-    ),
+    q: str,
+    lang: Optional[str] = None,
+    country: Optional[str] = None,
 ):
-    """
-    Keyword-based fetch:
-        - Uses core.fetch.fetch_news_from_user_query.
-        - Iterates over enabled portals' RSS feeds.
-        - Filters entries by keyword in title/summary.
-        - Inserts matched articles into SQLite via db.insert_articles().
-        - Returns freshly fetched articles grouped by keyword.
-
-    This is NOT FTS on the DB; it is a live data fetch using the user's keywords.
-    """
     lang_param = lang or None
     country_param = country or None
 
@@ -298,36 +217,71 @@ def keyword_search(
         country=country_param,
     )
 
-    # result structure from core.fetch.fetch_news_for_query():
-    # {
-    #   "keywords": [...],
-    #   "total_fetched": int,
-    #   "by_keyword": {
-    #       kw: [ {title, url, summary, content, source, keyword, published_at}, ... ]
-    #   }
-    # }
-
     keywords = result.get("keywords", [])
     total_fetched = result.get("total_fetched", 0)
     raw_by_kw = result.get("by_keyword", {})
 
     by_keyword_typed: Dict[str, List[FetchedArticle]] = {}
+    pos = neg = neu = unk = 0
 
     for kw, articles in raw_by_kw.items():
-        typed_list: List[FetchedArticle] = []
+        typed_list = []
         for art in articles:
-            typed_list.append(
-                FetchedArticle(
-                    title=art.get("title", ""),
-                    url=art.get("url", ""),
-                    summary=art.get("summary"),
-                    content=art.get("content"),
-                    source=art.get("source", ""),
-                    keyword=art.get("keyword", kw),
-                    published_at=art.get("published_at"),
-                )
+            url_value = art.get("url")
+            if not url_value:
+                continue  # skip invalid URLs
+
+            base = FetchedArticle(
+                title=art.get("title", ""),
+                url=url_value,
+                summary=art.get("summary"),
+                content=art.get("content"),
+                source=art.get("source", ""),
+                keyword=art.get("keyword", kw),
+                published_at=art.get("published_at"),
             )
+
+            text = (base.content or base.summary or base.title or "").strip()
+            if not text:
+                unk += 1
+                typed_list.append(base)
+                continue
+
+            try:
+                sd = analyze_bangladesh_sentiment(text)
+                sent = SentimentResult(**sd)
+                base.sentiment = sent
+
+                tb = (sent.towards_bangladesh or "").lower()
+                if tb == "positive":
+                    pos += 1
+                elif tb == "negative":
+                    neg += 1
+                elif tb == "neutral":
+                    neu += 1
+                else:
+                    unk += 1
+            except SentimentNotAvailable:
+                unk += 1
+
+            typed_list.append(base)
+
         by_keyword_typed[kw] = typed_list
+
+    total = pos + neg + neu + unk
+    overview = None
+    if total > 0:
+        overview = SentimentOverview(
+            total=total,
+            positive=pos,
+            negative=neg,
+            neutral=neu,
+            unknown=unk,
+            positive_pct=round(pos * 100 / total, 2),
+            negative_pct=round(neg * 100 / total, 2),
+            neutral_pct=round(neu * 100 / total, 2),
+            unknown_pct=round(unk * 100 / total, 2),
+        )
 
     return KeywordFetchResponse(
         raw_query=q,
@@ -336,81 +290,53 @@ def keyword_search(
         keywords=keywords,
         total_fetched=total_fetched,
         by_keyword=by_keyword_typed,
+        sentiment_overview=overview,
     )
 
 
 # ============================================================
-# FETCH BY URL (DB)
+# FETCH BY URL
 # ============================================================
 
 @app.get("/api/v1/news/by_url", response_model=SingleNewsResponse)
-def by_url(
-    url: str = Query(
-        ...,
-        description="Exact article URL that was scraped and stored in DB",
-    ),
-):
-    """
-    Fetch a single article from DB by its original URL.
-    """
+def by_url(url: str):
     row = db.get_by_url(url)
     if not row:
-        return SingleNewsResponse(found=False, item=None)
-
-    item = _row_to_news_item(row)
-    return SingleNewsResponse(found=True, item=item)
+        return SingleNewsResponse(found=False)
+    return SingleNewsResponse(found=True, item=_row_to_news_item(row))
 
 
 # ============================================================
-# SENTIMENT: arbitrary text
+# SENTIMENT FOR ARBITRARY TEXT
 # ============================================================
 
 @app.post("/api/v1/analyze/sentiment_text", response_model=SentimentResult)
 def analyze_sentiment_text(payload: AnalyzeTextRequest):
-    """
-    Analyze sentiment of arbitrary text and estimate whether it is
-    positive/negative towards Bangladesh.
-    """
     txt = (payload.text or "").strip()
     if not txt:
         raise HTTPException(status_code=400, detail="Text must not be empty")
 
     try:
         result = analyze_bangladesh_sentiment(txt)
+        return SentimentResult(**result)
     except SentimentNotAvailable as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
-    return SentimentResult(**result)
-
 
 # ============================================================
-# SENTIMENT: for a stored news article (by URL)
+# SENTIMENT FOR ARTICLE BY URL
 # ============================================================
 
 @app.get("/api/v1/news/sentiment_by_url", response_model=NewsSentimentResponse)
-def sentiment_by_url(
-    url: HttpUrl = Query(
-        ...,
-        description="Exact article URL that was scraped and stored in DB",
-    )
-):
-    """
-    Fetch article from DB by URL, then run Bangladesh sentiment analysis.
-
-    Uses content if available, else summary, else title.
-    """
+def sentiment_by_url(url: HttpUrl):
     row = db.get_by_url(str(url))
     if not row:
         raise HTTPException(status_code=404, detail="Article not found in DB")
 
     item = _row_to_news_item(row)
-
     text = item.content or item.summary or item.title
     if not text:
-        raise HTTPException(
-            status_code=400,
-            detail="Article has no content/summary/title to analyze",
-        )
+        raise HTTPException(status_code=400, detail="Article has no analyzable text")
 
     try:
         result = analyze_bangladesh_sentiment(text)
@@ -422,4 +348,62 @@ def sentiment_by_url(
         title=item.title,
         portal=item.portal,
         sentiment=SentimentResult(**result),
+    )
+
+
+# ============================================================
+# 🔥 NEW: ANALYTICS OVERVIEW FOR DASHBOARD
+# ============================================================
+
+@app.get("/api/v1/analytics/bd_sentiment_overview", response_model=SentimentOverview)
+def bd_sentiment_overview(
+    limit: int = Query(200, ge=1, le=500),
+    portal: Optional[str] = None,
+):
+    rows = db.get_latest(limit=limit, offset=0, portal=portal)
+
+    pos = neg = neu = unk = 0
+
+    for r in rows:
+        item = _row_to_news_item(r)
+        text = (item.content or item.summary or item.title or "").strip()
+
+        if not text:
+            unk += 1
+            continue
+
+        try:
+            sd = analyze_bangladesh_sentiment(text)
+            sent = SentimentResult(**sd)
+
+            tb = (sent.towards_bangladesh or "").lower()
+            if tb == "positive":
+                pos += 1
+            elif tb == "negative":
+                neg += 1
+            elif tb == "neutral":
+                neu += 1
+            else:
+                unk += 1
+
+        except SentimentNotAvailable:
+            unk += 1
+
+    total = pos + neg + neu + unk
+    if total == 0:
+        return SentimentOverview(
+            total=0, positive=0, negative=0, neutral=0, unknown=0,
+            positive_pct=0.0, negative_pct=0.0, neutral_pct=0.0, unknown_pct=0.0,
+        )
+
+    return SentimentOverview(
+        total=total,
+        positive=pos,
+        negative=neg,
+        neutral=neu,
+        unknown=unk,
+        positive_pct=round(pos * 100 / total, 2),
+        negative_pct=round(neg * 100 / total, 2),
+        neutral_pct=round(neu * 100 / total, 2),
+        unknown_pct=round(unk * 100 / total, 2),
     )
